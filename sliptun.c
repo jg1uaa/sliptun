@@ -292,7 +292,11 @@ static int open_tun(void)
 		goto fin0;
 
 	memset(&ifr, 0, sizeof(ifr));
-	ifr.ifr_flags = IFF_TUN; /* IFF_NO_PI is not used now */
+#ifdef USE_TUN_PI
+	ifr.ifr_flags = IFF_TUN;
+#else
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+#endif
 	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tundev);
 	if (ioctl(fd, TUNSETIFF, &ifr) < 0)
 		goto fin1;
