@@ -317,11 +317,12 @@ fin0:
 
 static int do_main(void)
 {
-	int ret = -1;
+	int flags, ret = -1;
 	struct termios t;
 	pthread_t tid;
 
-	if ((fd_ser = open(serdev, O_RDWR | O_NOCTTY | O_EXCL)) < 0) {
+	if ((fd_ser = open(serdev,
+			   O_RDWR | O_NOCTTY | O_EXCL | O_NONBLOCK)) < 0) {
 		printf("device open error (serial)\n");
 		goto fin0;
 	}
@@ -345,6 +346,12 @@ static int do_main(void)
 
 	tcflush(fd_ser, TCIOFLUSH);
 	tcsetattr(fd_ser, TCSANOW, &t);
+
+	if ((flags = fcntl(fd_ser, F_GETFL)) < 0 ||
+	    fcntl(fd_ser, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+		printf("fcntl error\n");
+		goto fin2;
+	}
 
 	if (pthread_create(&tid, NULL, &do_serial_tx, NULL)) {
 		printf("pthread_create error\n");
