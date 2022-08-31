@@ -22,18 +22,13 @@
 #if defined(__OpenBSD__) /* OpenBSD requires TUN packet information (PI) */
 #define USE_TUN_PI
 #include <sys/socket.h>
-#define PROTO_UNDEF AF_UNSPEC
 #define PROTO_INET AF_INET
 #define PROTO_INET6 AF_INET6
-#elif defined(__linux__) /* Linux supports TUN PI */
-#define USE_TUN_PI
+#elif defined(__linux__) /* Linux supports TUN PI, but not used */
+#undef USE_TUN_PI
 #include <sys/ioctl.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
-#include <linux/if_ether.h>
-#define PROTO_UNDEF 0
-#define PROTO_INET ETH_P_IP
-#define PROTO_INET6 ETH_P_IPV6
 #else /* Others (FreeBSD/NetBSD/DragonflyBSD) has no PI */
 #undef USE_TUN_PI
 #endif
@@ -75,24 +70,17 @@ struct tun_packet {
 	uint8_t data[BUFSIZE];
 } __attribute__((packed));
 
-static struct tun_packet tun_rx, tun_tx;
-
 #define END_CHAR 0xc0		/* indicates end of packet */
 #define ESC_CHAR 0xdb		/* indicates byte stuffing */
 #define ESCAPED_END 0xdc	/* ESC ESC_END means END data byte */
 #define ESCAPED_ESC 0xdd	/* ESC ESC_ESC means ESC data byte */
 
-static inline int put_serial_char(uint8_t c)
+static inline bool get_serial_char(int fd, uint8_t *c)
 {
-	return write(fd_ser, &c, sizeof(c)) != sizeof(c);
+	return die || read(fd, c, sizeof(*c)) != sizeof(*c);
 }
 
-static inline int get_serial_char(uint8_t *c)
-{
-	return read(fd_ser, c, sizeof(*c)) != sizeof(*c);
-}
-
-static void *do_serial_rx(__attribute__((unused)) void *arg)
+static ssize_t receive_slip_frame(int fd, uint8_t *buf, size_t bufsize)
 {
 	uint8_t c;
 	size_t len;
@@ -100,60 +88,74 @@ static void *do_serial_rx(__attribute__((unused)) void *arg)
 
 	len = 0;
 	received = false;
-	while (!die) {
-		if (get_serial_char(&c)) {
-			printf("serial read error\n");
-			goto fin0;
-		}
+	while (1) {
+		if (get_serial_char(fd, &c))
+			goto error;
 
 		switch (c) {
 		case END_CHAR:
-#ifdef USE_TUN_PI
-			if (received) {
-				uint16_t proto;
-
-				/* check IP version from header */
-				switch (tun_tx.data[0] >> 4) {
-				case 4:
-					proto = PROTO_INET;
-					break;
-				case 6:
-					proto = PROTO_INET6;
-					break;
-				default:
-					proto = PROTO_UNDEF;
-					received = false; /* discard */
-					break;
-				}
-
-				tun_tx.flags = 0;
-				tun_tx.proto = htons(proto);
-			}
-#endif
-			if (received) {
-				write(fd_tun, &tun_tx,
-				      offsetof(struct tun_packet, data[len]));
-			}
+			if (received)
+				goto success;
 
 			len = 0;
 			received = false;
 			break;
 
 		case ESC_CHAR:
-			if (get_serial_char(&c)) {
-				printf("serial read error\n");
-				goto fin0;
-			}
+			if (get_serial_char(fd, &c))
+				goto error;
 
 			if (c == ESCAPED_END) c = END_CHAR;
 			else if (c == ESCAPED_ESC) c = ESC_CHAR;
 
 			/* FALLTHROUGH */
 		default:
-			if (len < sizeof(tun_tx.data))
-				tun_tx.data[len++] = c;
+			if (len < bufsize)
+				buf[len++] = c;
 			received = true;
 			break;
+		}
+	}
+
+error:
+	return -1;
+success:
+	return len;
+}
+
+static void *do_slip_rx(__attribute__((unused)) void *arg)
+{
+	struct tun_packet tun_tx;
+	ssize_t len;
+	bool received;
+
+	while (!die) {
+		if ((len = receive_slip_frame(fd_ser, tun_tx.data,
+					      sizeof(tun_tx.data))) < 0) {
+			printf("slip read error\n");
+			goto fin0;
+		}
+
+		received = true;
+#ifdef USE_TUN_PI
+		/* check IP version from header */
+		switch (tun_tx.data[0] >> 4) {
+		case 4:
+			tun_tx.proto = htons(PROTO_INET);
+			break;
+		case 6:
+			tun_tx.proto = htons(PROTO_INET6);
+			break;
+		default:
+			received = false; /* discard */
+			break;
+		}
+
+		tun_tx.flags = 0;
+#endif
+		if (received) {
+			write(fd_tun, &tun_tx,
+			      offsetof(struct tun_packet, data[len]));
 		}
 	}
 
@@ -162,9 +164,51 @@ fin0:
 	return NULL;
 }
 
-static void *do_serial_tx(__attribute__((unused)) void *arg)
+static size_t build_slip_frame(uint8_t *out, uint8_t *in, size_t in_size)
 {
-	ssize_t i, size;
+#define put_buffer(c) {out[out_size++] = (c);}
+
+	size_t i, out_size = 0;
+
+	/*
+	 * RFC says send END character first to flush out
+	 * receiver accumulated garbage (by noise?)
+	 */
+	put_buffer(END_CHAR);
+
+	/*
+	 * send frame, two characters (END, ESC) needs to
+	 * handled by special sequence
+	 */
+	for (i = 0; i < in_size; i++) {
+		switch (in[i]) {
+		case END_CHAR:
+			put_buffer(ESC_CHAR);
+			put_buffer(ESCAPED_END);
+			break;
+		case ESC_CHAR:
+			put_buffer(ESC_CHAR);
+			put_buffer(ESCAPED_ESC);
+			break;
+		default:
+			put_buffer(in[i]);
+			break;
+		}
+	}
+
+	/* tell the receiver that "end of frame" */
+	put_buffer(END_CHAR);
+
+	return out_size;
+}
+
+static void *do_slip_tx(__attribute__((unused)) void *arg)
+{
+	struct tun_packet tun_rx;
+	ssize_t size;
+
+	/* END_CHAR + escaped character(2) * received size + END_CHAR */
+	uint8_t buf[2 * sizeof(tun_rx.data) + 2];
 
 	while (!die) {
 		if ((size = read(fd_tun, &tun_rx, sizeof(tun_rx))) < 0) {
@@ -172,35 +216,9 @@ static void *do_serial_tx(__attribute__((unused)) void *arg)
 			goto fin0;
 		}
 
-		/*
-		 * RFC says send END character first to flush out
-		 * receiver accumulated garbage (by noise?)
-		 */
-		put_serial_char(END_CHAR);
-
-		/*
-		 * send frame, two characters (END, ESC) needs to
-		 * handled by special sequence
-		 */
 		size -= offsetof(struct tun_packet, data);
-		for (i = 0; i < size; i++) {
-			switch (tun_rx.data[i]) {
-			case END_CHAR:
-				put_serial_char(ESC_CHAR);
-				put_serial_char(ESCAPED_END);
-				break;
-			case ESC_CHAR:
-				put_serial_char(ESC_CHAR);
-				put_serial_char(ESCAPED_ESC);
-				break;
-			default:
-				put_serial_char(tun_rx.data[i]);
-				break;
-			}
-		}
-
-		/* tell the receiver that "end of frame" */
-		put_serial_char(END_CHAR);
+		size = build_slip_frame(buf, tun_rx.data, size);
+		write(fd_ser, buf, size);
 	}
 
 fin0:
@@ -292,11 +310,7 @@ static int open_tun(void)
 		goto fin0;
 
 	memset(&ifr, 0, sizeof(ifr));
-#ifdef USE_TUN_PI
-	ifr.ifr_flags = IFF_TUN;
-#else
 	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-#endif
 	snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tundev);
 	if (ioctl(fd, TUNSETIFF, &ifr) < 0)
 		goto fin1;
@@ -353,12 +367,12 @@ static int do_main(void)
 		goto fin2;
 	}
 
-	if (pthread_create(&tid, NULL, &do_serial_tx, NULL)) {
+	if (pthread_create(&tid, NULL, &do_slip_tx, NULL)) {
 		printf("pthread_create error\n");
 		goto fin2;
 	}
 
-	do_serial_rx(NULL);
+	do_slip_rx(NULL);
 
 	pthread_cancel(tid);
 	pthread_join(tid, NULL);
