@@ -18,31 +18,35 @@
 #include <termios.h>
 #include <unistd.h>
 #include <pthread.h>
-
-#if defined(__OpenBSD__) /* OpenBSD requires TUN packet information (PI) */
-#define USE_TUN_PI
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#if defined(__OpenBSD__)
+#define USE_TUN_PI /* OpenBSD requires TUN packet information (PI) */
 #define PROTO_INET AF_INET
 #define PROTO_INET6 AF_INET6
-#elif defined(__linux__) /* Linux supports TUN PI, but not used */
-#undef USE_TUN_PI
+#elif defined(__linux__)
+/* Linux supports TUN PI, but not used */
 #include <sys/ioctl.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
-#else /* Others (FreeBSD/NetBSD/DragonflyBSD) has no PI */
-#undef USE_TUN_PI
-#endif
-
-#ifdef USE_TUN_PI
-#include <arpa/inet.h>
+#else
+/* Others (FreeBSD/NetBSD/DragonflyBSD) has no PI */
 #endif
 
 extern char *optarg;
 
 static char *serdev = NULL;
 static char *tundev = NULL;
-static int serspeed = -1;
 static bool rtscts = false;
+
+enum portmode {
+	NONE, SERIAL, TCP_CLIENT, TCP_SERVER,
+};
+static enum portmode portmode = NONE;
+static int portarg = -1;
 
 static int fd_ser, fd_tun;
 static bool die = false;
@@ -329,26 +333,18 @@ fin0:
 }
 #endif
 
-static int do_main(void)
+static int open_serial(void)
 {
-	int flags, ret = -1;
+	int fd, flags;
 	struct termios t;
-	pthread_t tid;
 
-	if ((fd_ser = open(serdev,
-			   O_RDWR | O_NOCTTY | O_EXCL | O_NONBLOCK)) < 0) {
-		printf("device open error (serial)\n");
+	if ((fd = open(serdev,
+		       O_RDWR | O_NOCTTY | O_EXCL | O_NONBLOCK)) < 0)
 		goto fin0;
-	}
-
-	if ((fd_tun = open_tun()) < 0) {
-		printf("device open error (tun)\n");
-		goto fin1;
-	}
 
 	memset(&t, 0, sizeof(t));
-	cfsetospeed(&t, get_speed(serspeed));
-	cfsetispeed(&t, get_speed(serspeed));
+	cfsetospeed(&t, get_speed(portarg));
+	cfsetispeed(&t, get_speed(portarg));
 
 	t.c_cflag |= CREAD | CLOCAL | CS8;
 	if (rtscts) t.c_cflag |= CRTSCTS;
@@ -358,13 +354,143 @@ static int do_main(void)
 	t.c_cc[VTIME] = 0;
 	t.c_cc[VMIN] = 1;
 
-	tcflush(fd_ser, TCIOFLUSH);
-	tcsetattr(fd_ser, TCSANOW, &t);
+	tcflush(fd, TCIOFLUSH);
+	tcsetattr(fd, TCSANOW, &t);
 
-	if ((flags = fcntl(fd_ser, F_GETFL)) < 0 ||
-	    fcntl(fd_ser, F_SETFL, flags & ~O_NONBLOCK) < 0) {
-		printf("fcntl error\n");
-		goto fin2;
+	if ((flags = fcntl(fd, F_GETFL)) < 0 ||
+	    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0)
+		goto fin1;
+
+	goto fin0;
+
+fin1:
+	close(fd);
+	fd = -1;
+fin0:
+	return fd;
+}
+
+static const char *inet_ntopXX(int af, const void *src, char *dst, socklen_t size)
+{
+	struct sockaddr_in *s4 = (struct sockaddr_in *)src;
+	struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)src;
+
+	switch (af) {
+	case AF_INET:
+		return inet_ntop(af, &s4->sin_addr.s_addr, dst, size);
+	case AF_INET6:
+		return inet_ntop(af, &s6->sin6_addr.s6_addr, dst, size);
+	default:
+		return strncpy(dst, "unknown", size);
+	}
+}
+
+static struct addrinfo *acquire_address_info(void)
+{
+	struct addrinfo hints, *res;
+	char tmp[16];
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_flags = AI_NUMERICSERV;
+	hints.ai_socktype = SOCK_STREAM;
+	snprintf(tmp, sizeof(tmp), "%d", portarg);
+
+	return getaddrinfo(serdev, tmp, &hints, &res) ? NULL : res;
+}
+
+static int open_tcp_server(void)
+{
+	int s, fd = -1;
+	struct addrinfo *res, *res0;
+	struct sockaddr_storage ss;
+	socklen_t ss_len;
+	char addr_str[INET6_ADDRSTRLEN];
+
+	if ((res0 = acquire_address_info()) == NULL)
+		goto fin0;
+
+	/* currently only one socket is accepted */
+	for (res = res0; res; res = res->ai_next) {
+		if ((s = socket(res->ai_family, res->ai_socktype,
+				res->ai_protocol)) < 0)
+			continue;
+
+		ss_len = sizeof(ss);
+		if (bind(s, res->ai_addr, res->ai_addrlen) >= 0 &&
+		    listen(s, 1) >= 0 &&
+		    (fd = accept(s, (struct sockaddr *)&ss, &ss_len)) >= 0) {
+			inet_ntopXX(ss.ss_family, &ss,
+				    addr_str, sizeof(addr_str));
+			printf("*** CONNECTED from %s\n", addr_str);
+			break;
+		}
+
+		close(s);
+	}
+
+	freeaddrinfo(res0);
+fin0:
+	return fd;
+}
+
+static int open_tcp_client(void)
+{
+	int s = -1;
+	struct addrinfo *res, *res0;
+	char addr_str[INET6_ADDRSTRLEN];
+
+	if ((res0 = acquire_address_info()) == NULL)
+		goto fin0;
+
+	for (res = res0; res; res = res->ai_next) {
+		if ((s = socket(res->ai_family, res->ai_socktype,
+				 res->ai_protocol)) < 0)
+			continue;
+
+		if (connect(s, res->ai_addr, res->ai_addrlen) >= 0) {
+			inet_ntopXX(res->ai_family, res->ai_addr,
+				    addr_str, sizeof(addr_str));
+			printf("*** CONNECTED to %s\n", addr_str);
+			break;
+		}
+
+		close(s);
+		s = -1;
+	}
+
+	freeaddrinfo(res0);
+fin0:
+	return s;
+}
+
+static int do_main(void)
+{
+	int ret = -1;
+	pthread_t tid;
+
+	switch (portmode) {
+	case SERIAL:
+		fd_ser = open_serial();
+		break;
+	case TCP_CLIENT:
+		fd_ser = open_tcp_client();
+		break;
+	case TCP_SERVER:
+		fd_ser = open_tcp_server();
+		break;
+	default:
+		fd_ser = -1;
+		break;
+	}
+	if (fd_ser < 0) {
+		printf("device open error (serial)\n");
+		goto fin0;
+	}
+
+	if ((fd_tun = open_tun()) < 0) {
+		printf("device open error (tun)\n");
+		goto fin1;
 	}
 
 	if (pthread_create(&tid, NULL, &do_slip_tx, NULL)) {
@@ -390,10 +516,19 @@ int main(int argc, char *argv[])
 {
 	int ch;
 
-	while ((ch = getopt(argc, argv, "s:l:t:f")) != -1) {
+	while ((ch = getopt(argc, argv, "s:p:P:l:t:f")) != -1) {
 		switch (ch) {
 		case 's':
-			serspeed = atoi(optarg);
+			portmode = SERIAL;
+			portarg = atoi(optarg);
+			break;
+		case 'p':
+			portmode = TCP_CLIENT;
+			portarg = atoi(optarg);
+			break;
+		case 'P':
+			portmode = TCP_SERVER;
+			portarg = atoi(optarg);
 			break;
 		case 'l':
 			serdev = optarg;
@@ -407,8 +542,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (serdev == NULL || tundev == NULL || serspeed < 0 ||
-	    get_speed(serspeed) < 0) {
+	if (serdev == NULL || tundev == NULL || portmode == NONE ||
+	    (portmode == SERIAL && get_speed(portarg) < 0)) {
 		printf("usage: %s: -s [serial speed] -l [serial device] "
 		       "-t [tun device]\n", argv[0]);
 		goto fin0;
