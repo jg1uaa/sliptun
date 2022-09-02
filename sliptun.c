@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <poll.h>
 
 #if defined(__OpenBSD__)
 #define USE_TUN_PI /* OpenBSD requires TUN packet information (PI) */
@@ -46,10 +47,12 @@ enum portmode {
 	NONE, SERIAL, TCP_CLIENT, TCP_SERVER,
 };
 static enum portmode portmode = NONE;
-static int portarg = -1;
+static int portarg;
 
 static int fd_ser, fd_tun;
 static bool die = false;
+
+#define TCP_MAX_SOCKET 2
 
 /*
  * OpenBSD's <net/if_tun.h> defines TUNMTU (3000) and TUNMRU (16384),
@@ -333,9 +336,18 @@ fin0:
 }
 #endif
 
+static bool set_nonblock(int d, bool nonblock)
+{
+	int flags;
+
+	return ((flags = fcntl(d, F_GETFL)) < 0 ||
+		fcntl(d, F_SETFL, nonblock ?
+		      (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) < 0);
+}
+
 static int open_serial(void)
 {
-	int fd, flags;
+	int fd;
 	struct termios t;
 
 	if ((fd = open(serdev,
@@ -357,8 +369,7 @@ static int open_serial(void)
 	tcflush(fd, TCIOFLUSH);
 	tcsetattr(fd, TCSANOW, &t);
 
-	if ((flags = fcntl(fd, F_GETFL)) < 0 ||
-	    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0)
+	if (set_nonblock(fd, false))
 		goto fin1;
 
 	goto fin0;
@@ -399,9 +410,40 @@ static struct addrinfo *acquire_address_info(void)
 	return getaddrinfo(serdev, tmp, &hints, &res) ? NULL : res;
 }
 
+static int wait_for_accept(int *list, int entries)
+{
+	int i, s = -1;
+	struct pollfd *pfd;
+
+	if (entries <= 0 ||
+	    (pfd = calloc(sizeof(struct pollfd), entries)) == NULL)
+		goto fin0;
+
+	for (i = 0; i < entries; i++) {
+		pfd[i].fd = list[i];
+		pfd[i].events = POLLIN;
+	}
+
+	if (poll(pfd, entries, -1) <= 0)
+		goto fin1;
+
+	for (i = 0; i < entries; i++) {
+		if (pfd[i].revents & POLLIN) {
+			s = list[i];
+			break;
+		}
+	}
+
+fin1:
+	free(pfd);
+fin0:
+	return s;
+}
+
 static int open_tcp_server(void)
 {
-	int s, fd = -1;
+	int i, s, enable = 1, fd = -1;
+	int sock[TCP_MAX_SOCKET], numsock;
 	struct addrinfo *res, *res0;
 	struct sockaddr_storage ss;
 	socklen_t ss_len;
@@ -410,24 +452,45 @@ static int open_tcp_server(void)
 	if ((res0 = acquire_address_info()) == NULL)
 		goto fin0;
 
-	/* currently only one socket is accepted */
-	for (res = res0; res; res = res->ai_next) {
+	numsock = 0;
+	for (res = res0; res && numsock < TCP_MAX_SOCKET;
+	     res = res->ai_next) {
 		if ((s = socket(res->ai_family, res->ai_socktype,
 				res->ai_protocol)) < 0)
 			continue;
 
-		ss_len = sizeof(ss);
-		if (bind(s, res->ai_addr, res->ai_addrlen) >= 0 &&
-		    listen(s, 1) >= 0 &&
-		    (fd = accept(s, (struct sockaddr *)&ss, &ss_len)) >= 0) {
-			inet_ntopXX(ss.ss_family, &ss,
-				    addr_str, sizeof(addr_str));
-			printf("*** CONNECTED from %s\n", addr_str);
-			break;
+		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+			       &enable, sizeof(enable)) >= 0 &&
+		    bind(s, res->ai_addr, res->ai_addrlen) >= 0 &&
+		    listen(s, 1) >= 0 && !set_nonblock(s, true)) {
+			sock[numsock++] = s;
+			continue;
 		}
 
 		close(s);
 	}
+
+	while (1) {
+		if ((s = wait_for_accept(sock, numsock)) < 0)
+			break;
+
+		ss_len = sizeof(ss);
+		if ((fd = accept(s, (struct sockaddr *)&ss, &ss_len)) < 0)
+			continue;
+
+		/* nonblock is inherited from original socket (OpenBSD) */
+		if (set_nonblock(fd, false)) {
+			fd = s = -1;
+			break;
+		}
+
+		inet_ntopXX(ss.ss_family, &ss, addr_str, sizeof(addr_str));
+		printf("*** CONNECTED from %s\n", addr_str);
+		break;
+	}
+
+	for (i = 0; i < numsock; i++)
+		if (s != sock[i]) close(sock[i]);
 
 	freeaddrinfo(res0);
 fin0:
