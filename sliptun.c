@@ -532,6 +532,11 @@ static int do_main(void)
 	int ret = -1;
 	pthread_t tid;
 
+	if ((fd_tun = open_tun()) < 0) {
+		printf("device open error (tun)\n");
+		goto fin0;
+	}
+
 	switch (portmode) {
 	case SERIAL:
 		fd_ser = open_serial();
@@ -548,11 +553,6 @@ static int do_main(void)
 	}
 	if (fd_ser < 0) {
 		printf("device open error (serial)\n");
-		goto fin0;
-	}
-
-	if ((fd_tun = open_tun()) < 0) {
-		printf("device open error (tun)\n");
 		goto fin1;
 	}
 
@@ -568,9 +568,9 @@ static int do_main(void)
 	ret = 0;
 
 fin2:
-	close(fd_tun);
-fin1:
 	close(fd_ser);
+fin1:
+	close(fd_tun);
 fin0:
 	return ret;
 }
