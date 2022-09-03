@@ -4,4 +4,4 @@ $(TARGET): $(TARGET).c
 	$(CC) -Wall -O2 -pthread $< -o $@
 
 clean:
-	$(RM) $(TARGET)
+	rm -f $(TARGET)
