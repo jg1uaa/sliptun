@@ -82,52 +82,46 @@ struct tun_packet {
 #define ESCAPED_END 0xdc	/* ESC ESC_END means END data byte */
 #define ESCAPED_ESC 0xdd	/* ESC ESC_ESC means ESC data byte */
 
-static inline bool get_serial_char(int fd, uint8_t *c)
-{
-	return die || read(fd, c, sizeof(*c)) != sizeof(*c);
-}
+struct decode_work {
+	int outpos;
+	int inpos;
+	bool esc;
+};
 
-static ssize_t receive_slip_frame(int fd, uint8_t *buf, size_t bufsize)
+static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize, struct decode_work *w)
 {
 	uint8_t c;
-	size_t len;
-	bool received;
 
-	len = 0;
-	received = false;
-	while (1) {
-		if (get_serial_char(fd, &c))
-			goto error;
+	for (; w->inpos < insize; w->inpos++) {
+		c = in[w->inpos];
 
-		switch (c) {
-		case END_CHAR:
-			if (received)
-				goto success;
-
-			len = 0;
-			received = false;
-			break;
-
-		case ESC_CHAR:
-			if (get_serial_char(fd, &c))
-				goto error;
-
+		if (w->esc) {
+			w->esc = false;
 			if (c == ESCAPED_END) c = END_CHAR;
 			else if (c == ESCAPED_ESC) c = ESC_CHAR;
 
-			/* FALLTHROUGH */
-		default:
-			if (len < bufsize)
-				buf[len++] = c;
-			received = true;
-			break;
+			if (w->outpos < outsize)
+				out[w->outpos++] = c;
+		} else {
+			switch (c) {
+			case END_CHAR:
+				if (w->outpos) {
+					w->inpos++;
+					return true;
+				}
+				break;
+			case ESC_CHAR:
+				w->esc = true;
+				break;
+			default:
+				if (w->outpos < outsize)
+					out[w->outpos++] = c;
+				break;
+			}
 		}
 	}
 
-error:
-	return -1;
-success:
-	return len;
+	return false;
 }
 
 static void *do_slip_rx(__attribute__((unused)) void *arg)
@@ -135,34 +129,48 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 	struct tun_packet tun_tx;
 	ssize_t len;
 	bool received;
+	uint8_t buf[sizeof(tun_tx.data)];
+	struct decode_work w = {
+		.outpos = 0,
+		.inpos = 0,
+		.esc = false,
+	};
 
 	while (!die) {
-		if ((len = receive_slip_frame(fd_ser, tun_tx.data,
-					      sizeof(tun_tx.data))) < 0) {
+		if ((len = read(fd_ser, buf, sizeof(buf))) <= 0) {
 			printf("slip read error\n");
 			goto fin0;
 		}
+		w.inpos = 0;
 
-		received = true;
+		while (1) {
+			received = decode_slip_frame(tun_tx.data,
+						     sizeof(tun_tx.data),
+						     buf, len, &w);
+			if (!received)
+				break;
 #ifdef USE_TUN_PI
-		/* check IP version from header */
-		switch (tun_tx.data[0] >> 4) {
-		case 4:
-			tun_tx.proto = htons(PROTO_INET);
-			break;
-		case 6:
-			tun_tx.proto = htons(PROTO_INET6);
-			break;
-		default:
-			received = false; /* discard */
-			break;
-		}
+			/* check IP version from header */
+			switch (tun_tx.data[0] >> 4) {
+			case 4:
+				tun_tx.proto = htons(PROTO_INET);
+				break;
+			case 6:
+				tun_tx.proto = htons(PROTO_INET6);
+				break;
+			default:
+				received = false; /* discard */
+				break;
+			}
 
-		tun_tx.flags = 0;
+			tun_tx.flags = 0;
 #endif
-		if (received) {
-			write(fd_tun, &tun_tx,
-			      offsetof(struct tun_packet, data[len]));
+			if (received) {
+				write(fd_tun, &tun_tx,
+				      offsetof(struct tun_packet,
+					       data[w.outpos]));
+			}
+			w.outpos = 0;
 		}
 	}
 
@@ -171,7 +179,7 @@ fin0:
 	return NULL;
 }
 
-static size_t build_slip_frame(uint8_t *out, uint8_t *in, size_t in_size)
+static size_t encode_slip_frame(uint8_t *out, uint8_t *in, size_t in_size)
 {
 #define put_buffer(c) {out[out_size++] = (c);}
 
@@ -223,8 +231,10 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 			goto fin0;
 		}
 
-		size -= offsetof(struct tun_packet, data);
-		size = build_slip_frame(buf, tun_rx.data, size);
+		if ((size -= offsetof(struct tun_packet, data)) < 0)
+			continue;
+
+		size = encode_slip_frame(buf, tun_rx.data, size);
 		write(fd_ser, buf, size);
 	}
 
