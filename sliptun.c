@@ -618,7 +618,7 @@ int main(int argc, char *argv[])
 
 	if (serdev == NULL || tundev == NULL || portmode == NONE ||
 	    (portmode == SERIAL && get_speed(portarg) < 0)) {
-		printf("usage: %s: -s [serial speed] -l [serial device] "
+		printf("usage: %s -s [serial speed] -l [serial device] "
 		       "-t [tun device]\n", argv[0]);
 		goto fin0;
 	}
