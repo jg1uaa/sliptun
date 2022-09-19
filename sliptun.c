@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -70,18 +71,21 @@ static bool die = false;
  *        Linux uses ethernet type defined by <linux/if_ether.h>.
  *        OpenBSD uses address/protocol family, <sys/socket.h>.
  */
-struct tun_packet {
-#ifdef USE_TUN_PI
+#if defined(USE_TUN_PI) && defined(__OpenBSD__)
+struct tun_pi {
 	uint16_t flags;
 	uint16_t proto;
-#endif
-	uint8_t data[BUFSIZE];
 } __attribute__((packed));
+#endif
 
 #define END_CHAR 0xc0		/* indicates end of packet */
 #define ESC_CHAR 0xdb		/* indicates byte stuffing */
 #define ESCAPED_END 0xdc	/* ESC ESC_END means END data byte */
 #define ESCAPED_ESC 0xdd	/* ESC ESC_ESC means ESC data byte */
+
+struct encode_work {
+	int outpos;
+};
 
 struct decode_work {
 	int outpos;
@@ -127,15 +131,24 @@ static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 
 static void *do_slip_rx(__attribute__((unused)) void *arg)
 {
-	struct tun_packet tun_tx;
 	ssize_t len;
 	bool received;
-	uint8_t buf[sizeof(tun_tx.data)];
+	uint8_t buf[BUFSIZE], tun_tx[BUFSIZE];
 	struct decode_work w = {
 		.outpos = 0,
 		.inpos = 0,
 		.esc = false,
 	};
+#ifdef USE_TUN_PI
+	struct tun_pi pi = {.flags = 0};
+#endif
+	struct iovec iov[] = {
+#ifdef USE_TUN_PI
+		{.iov_base = &pi, .iov_len = sizeof(pi)},
+#endif
+		{.iov_base = tun_tx, .iov_len = 0},
+	};
+	const int iovcnt = sizeof(iov) / sizeof(struct iovec);
 
 	while (!die) {
 		if ((len = read(fd_ser, buf, sizeof(buf))) <= 0) {
@@ -145,31 +158,27 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 		w.inpos = 0;
 
 		while (1) {
-			received = decode_slip_frame(tun_tx.data,
-						     sizeof(tun_tx.data),
+			received = decode_slip_frame(tun_tx, sizeof(tun_tx),
 						     buf, len, &w);
 			if (!received)
 				break;
 #ifdef USE_TUN_PI
 			/* check IP version from header */
-			switch (tun_tx.data[0] >> 4) {
+			switch (tun_tx[0] >> 4) {
 			case 4:
-				tun_tx.proto = htons(PROTO_INET);
+				pi.proto = htons(PROTO_INET);
 				break;
 			case 6:
-				tun_tx.proto = htons(PROTO_INET6);
+				pi.proto = htons(PROTO_INET6);
 				break;
 			default:
 				received = false; /* discard */
 				break;
 			}
-
-			tun_tx.flags = 0;
 #endif
 			if (received) {
-				write(fd_tun, &tun_tx,
-				      offsetof(struct tun_packet,
-					       data[w.outpos]));
+				iov[iovcnt - 1].iov_len = w.outpos;
+				writev(fd_tun, iov, iovcnt);
 			}
 			w.outpos = 0;
 		}
@@ -180,63 +189,66 @@ fin0:
 	return NULL;
 }
 
-static size_t encode_slip_frame(uint8_t *out, uint8_t *in, size_t in_size)
+static void encode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize, struct encode_work *w)
 {
-#define put_buffer(c) {out[out_size++] = (c);}
+#define put_buffer(c) {if (w->outpos < outsize) out[w->outpos++] = (c);}
 
-	size_t i, out_size = 0;
+	int i;
 
-	/*
-	 * RFC says send END character first to flush out
-	 * receiver accumulated garbage (by noise?)
-	 */
-	put_buffer(END_CHAR);
-
-	/*
-	 * send frame, two characters (END, ESC) needs to
-	 * handled by special sequence
-	 */
-	for (i = 0; i < in_size; i++) {
-		switch (in[i]) {
-		case END_CHAR:
-			put_buffer(ESC_CHAR);
-			put_buffer(ESCAPED_END);
-			break;
-		case ESC_CHAR:
-			put_buffer(ESC_CHAR);
-			put_buffer(ESCAPED_ESC);
-			break;
-		default:
-			put_buffer(in[i]);
-			break;
+	if (insize) {
+		for (i = 0; i < insize; i++) {
+			switch (in[i]) {
+			case END_CHAR:
+				put_buffer(ESC_CHAR);
+				put_buffer(ESCAPED_END);
+				break;
+			case ESC_CHAR:
+				put_buffer(ESC_CHAR);
+				put_buffer(ESCAPED_ESC);
+				break;
+			default:
+				put_buffer(in[i]);
+				break;
+			}
 		}
+	} else {
+		put_buffer(END_CHAR);
 	}
-
-	/* tell the receiver that "end of frame" */
-	put_buffer(END_CHAR);
-
-	return out_size;
 }
 
 static void *do_slip_tx(__attribute__((unused)) void *arg)
 {
-	struct tun_packet tun_rx;
 	ssize_t size;
-
+	struct encode_work w;
 	/* END_CHAR + escaped character(2) * received size + END_CHAR */
-	uint8_t buf[2 * sizeof(tun_rx.data) + 2];
+	uint8_t buf[2 * BUFSIZE + 2], tun_rx[BUFSIZE];
+#ifdef USE_TUN_PI
+	struct tun_pi pi;
+#endif
+	struct iovec iov[] = {
+#ifdef USE_TUN_PI
+		{.iov_base = &pi, .iov_len = sizeof(pi)},
+#endif
+		{.iov_base = tun_rx, .iov_len = sizeof(tun_rx)},
+	};
+	const int iovcnt = sizeof(iov) / sizeof(struct iovec);
 
 	while (!die) {
-		if ((size = read(fd_tun, &tun_rx, sizeof(tun_rx))) < 0) {
+		if ((size = readv(fd_tun, iov, iovcnt)) < 0) {
 			printf("tun read error\n");
 			goto fin0;
 		}
 
-		if ((size -= offsetof(struct tun_packet, data)) < 0)
+#ifdef USE_TUN_PI
+		if ((size -= sizeof(pi)) < 0)
 			continue;
+#endif
 
-		size = encode_slip_frame(buf, tun_rx.data, size);
-		write(fd_ser, buf, size);
+		w.outpos = 0;
+		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
+		encode_slip_frame(buf, sizeof(buf), tun_rx, size, &w);
+		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
+		write(fd_ser, buf, w.outpos);
 	}
 
 fin0:
