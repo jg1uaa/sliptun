@@ -513,7 +513,7 @@ static int open_tcp_server(void)
 	}
 
 	for (i = 0; i < numsock; i++)
-		if (s != sock[i]) close(sock[i]);
+		close(sock[i]);
 
 	freeaddrinfo(res0);
 fin0:
