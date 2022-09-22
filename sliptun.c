@@ -225,7 +225,7 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 #ifdef USE_TUN_PI
 	struct tun_pi pi;
 #endif
-	struct iovec iov[] = {
+	const struct iovec iov[] = {
 #ifdef USE_TUN_PI
 		{.iov_base = &pi, .iov_len = sizeof(pi)},
 #endif
