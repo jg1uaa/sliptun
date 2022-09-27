@@ -44,6 +44,8 @@ extern char *optarg;
 static char *serdev = NULL;
 static char *tundev = NULL;
 static bool rtscts = false;
+static bool extmode = false;
+static char *extarg;
 
 enum portmode {
 	NONE, SERIAL, TCP_CLIENT, TCP_SERVER,
@@ -61,6 +63,7 @@ static bool die = false;
  * but there is no definition in Linux. 16Kbyte may be enough. 
  */
 #define BUFSIZE 16384
+#define EXBUFSIZE 64
 
 /*
  * TUN packet information and data frame (see <linux/if_tun.h>)
@@ -92,6 +95,23 @@ struct decode_work {
 	int inpos;
 	bool esc;
 };
+
+__attribute__((weak)) ssize_t ext_encode(uint8_t *buf, int len, uint8_t *exbuf, int exlen)
+{
+	return 0;
+}
+
+__attribute__((weak)) ssize_t ext_decode(uint8_t *buf, int len, uint8_t **ip)
+{
+	*ip = buf;
+	return len;
+}
+
+ __attribute__((weak)) bool ext_init(char *arg)
+{
+	printf("extended feature is not implemented\n");
+	return false;
+}
 
 static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize, struct decode_work *w)
 {
@@ -131,9 +151,9 @@ static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 
 static void *do_slip_rx(__attribute__((unused)) void *arg)
 {
-	ssize_t len;
+	ssize_t len, n;
 	bool received;
-	uint8_t buf[BUFSIZE], tun_tx[BUFSIZE];
+	uint8_t buf[BUFSIZE], tun_tx[BUFSIZE], *p;
 	struct decode_work w = {
 		.outpos = 0,
 		.inpos = 0,
@@ -146,12 +166,12 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 #ifdef USE_TUN_PI
 		{.iov_base = &pi, .iov_len = sizeof(pi)},
 #endif
-		{.iov_base = tun_tx, .iov_len = 0},
+		{.iov_base = NULL, .iov_len = 0},
 	};
 	const int iovcnt = sizeof(iov) / sizeof(struct iovec);
 
 	while (!die) {
-		if ((len = read(fd_ser, buf, sizeof(buf))) <= 0) {
+		if ((len = read(fd_ser, buf, sizeof(buf))) < 1) {
 			printf("slip read error\n");
 			goto fin0;
 		}
@@ -162,9 +182,18 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 						     buf, len, &w);
 			if (!received)
 				break;
+
+			if (extmode) {
+				if ((n = ext_decode(tun_tx,
+						      w.outpos, &p)) < 1)
+					goto next;
+			} else {
+				n = w.outpos;
+				p = tun_tx;
+			}
 #ifdef USE_TUN_PI
 			/* check IP version from header */
-			switch (tun_tx[0] >> 4) {
+			switch (p[0] >> 4) {
 			case 4:
 				pi.proto = htons(PROTO_INET);
 				break;
@@ -172,14 +201,13 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 				pi.proto = htons(PROTO_INET6);
 				break;
 			default:
-				received = false; /* discard */
-				break;
+				goto next; /* discard */
 			}
 #endif
-			if (received) {
-				iov[iovcnt - 1].iov_len = w.outpos;
-				writev(fd_tun, iov, iovcnt);
-			}
+			iov[iovcnt - 1].iov_base = p;
+			iov[iovcnt - 1].iov_len = n;
+			writev(fd_tun, iov, iovcnt);
+		next:
 			w.outpos = 0;
 		}
 	}
@@ -218,10 +246,11 @@ static void encode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 
 static void *do_slip_tx(__attribute__((unused)) void *arg)
 {
-	ssize_t size;
+	ssize_t size, exsize;
 	struct encode_work w;
+	uint8_t exbuf[EXBUFSIZE], tun_rx[BUFSIZE];
 	/* END_CHAR + escaped character(2) * received size + END_CHAR */
-	uint8_t buf[2 * BUFSIZE + 2], tun_rx[BUFSIZE];
+	uint8_t buf[2 * (sizeof(exbuf) + sizeof(tun_rx)) + 2];
 #ifdef USE_TUN_PI
 	struct tun_pi pi;
 #endif
@@ -244,8 +273,18 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 			continue;
 #endif
 
+		if (extmode) {
+			if ((exsize = ext_encode(buf, size,
+						 exbuf, sizeof(exbuf))) < 0)
+				continue;
+		} else {
+			exsize = 0;
+		}
+
 		w.outpos = 0;
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
+		if (exsize)
+			encode_slip_frame(buf, sizeof(buf), exbuf, exsize, &w);
 		encode_slip_frame(buf, sizeof(buf), tun_rx, size, &w);
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
 		write(fd_ser, buf, w.outpos);
@@ -602,7 +641,7 @@ int main(int argc, char *argv[])
 {
 	int ch;
 
-	while ((ch = getopt(argc, argv, "s:p:P:l:t:f")) != -1) {
+	while ((ch = getopt(argc, argv, "s:p:P:l:t:fx:")) != -1) {
 		switch (ch) {
 		case 's':
 			portmode = SERIAL;
@@ -625,6 +664,10 @@ int main(int argc, char *argv[])
 		case 'f':
 			rtscts = true;
 			break;
+		case 'x':
+			extmode = true;
+			extarg = optarg;
+			break;
 		}
 	}
 
@@ -634,6 +677,9 @@ int main(int argc, char *argv[])
 		       "-t [tun device]\n", argv[0]);
 		goto fin0;
 	}
+
+	if (extmode && ext_init(extarg))
+		goto fin0;
 
 	do_main();
 
