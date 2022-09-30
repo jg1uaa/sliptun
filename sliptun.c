@@ -63,7 +63,7 @@ static bool die = false;
  * but there is no definition in Linux. 16Kbyte may be enough. 
  */
 #define BUFSIZE 16384
-#define EXBUFSIZE 64
+#define EXBUFSIZE 128
 
 /*
  * TUN packet information and data frame (see <linux/if_tun.h>)
@@ -96,16 +96,20 @@ struct decode_work {
 	bool esc;
 };
 
-__attribute__((weak)) ssize_t ext_encode(uint8_t *buf, int len, uint8_t *exbuf, int exlen)
+static int ext_dummy(uint8_t **buf, int *len, uint8_t *exbuf, int exlen)
 {
-	return 0;
-}
+	int n;
 
-__attribute__((weak)) ssize_t ext_decode(uint8_t *buf, int len, uint8_t **ip)
-{
-	*ip = buf;
-	return len;
+	/* test code: simply move top of buf to exbuf */
+	n = (*len < exlen) ? *len : exlen;
+	memcpy(exbuf, *buf, n);
+	*buf += n;
+	*len -= n;
+
+	return n;
 }
+int ext_encode(uint8_t **buf, int *len, uint8_t *exbuf, int exlen) __attribute__((weak, alias("ext_dummy")));
+int ext_decode(uint8_t **buf, int *len, uint8_t *exbuf, int exlen) __attribute__((weak, alias("ext_dummy")));
 
  __attribute__((weak)) bool ext_init(char *arg)
 {
@@ -151,9 +155,9 @@ static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 
 static void *do_slip_rx(__attribute__((unused)) void *arg)
 {
-	ssize_t len, n;
-	bool received;
-	uint8_t buf[BUFSIZE], tun_tx[BUFSIZE], *p;
+	ssize_t size;
+	int exsize, n;
+	uint8_t exbuf[EXBUFSIZE], buf[BUFSIZE], tun_tx[BUFSIZE], *p;
 	struct decode_work w = {
 		.outpos = 0,
 		.inpos = 0,
@@ -167,32 +171,51 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 		{.iov_base = &pi, .iov_len = sizeof(pi)},
 #endif
 		{.iov_base = NULL, .iov_len = 0},
+		{.iov_base = NULL, .iov_len = 0},
 	};
-	const int iovcnt = sizeof(iov) / sizeof(struct iovec);
+	int iovcnt;
 
 	while (!die) {
-		if ((len = read(fd_ser, buf, sizeof(buf))) < 1) {
+		if ((size = read(fd_ser, buf, sizeof(buf))) < 1) {
 			printf("slip read error\n");
 			goto fin0;
 		}
 		w.inpos = 0;
 
 		while (1) {
-			received = decode_slip_frame(tun_tx, sizeof(tun_tx),
-						     buf, len, &w);
-			if (!received)
+			if (!decode_slip_frame(tun_tx, sizeof(tun_tx),
+					       buf, size, &w))
 				break;
 
+			p = tun_tx;
+			n = w.outpos;
 			if (extmode) {
-				if ((n = ext_decode(tun_tx,
-						      w.outpos, &p)) < 1)
+				if ((exsize = ext_decode(&p, &n, exbuf,
+							 sizeof(exbuf))) < 0)
 					goto next;
 			} else {
-				n = w.outpos;
-				p = tun_tx;
+				exsize = 0;
+			}
+#ifdef USE_TUN_PI
+			iovcnt = 1;
+#else
+			iovcnt = 0;
+#endif
+			if (exsize) {
+				iov[iovcnt].iov_base = exbuf;
+				iov[iovcnt].iov_len = exsize;
+				iovcnt++;
+			}
+			if (n) {
+				iov[iovcnt].iov_base = p;
+				iov[iovcnt].iov_len = n;
+				iovcnt++;
 			}
 #ifdef USE_TUN_PI
 			/* check IP version from header */
+			if (exsize)
+				p = exbuf;
+
 			switch (p[0] >> 4) {
 			case 4:
 				pi.proto = htons(PROTO_INET);
@@ -204,8 +227,6 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 				goto next; /* discard */
 			}
 #endif
-			iov[iovcnt - 1].iov_base = p;
-			iov[iovcnt - 1].iov_len = n;
 			writev(fd_tun, iov, iovcnt);
 		next:
 			w.outpos = 0;
@@ -246,9 +267,10 @@ static void encode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 
 static void *do_slip_tx(__attribute__((unused)) void *arg)
 {
-	ssize_t size, exsize;
+	ssize_t size;
+	int exsize, n;
 	struct encode_work w;
-	uint8_t exbuf[EXBUFSIZE], tun_rx[BUFSIZE];
+	uint8_t exbuf[EXBUFSIZE], tun_rx[BUFSIZE], *p;
 	/* END_CHAR + escaped character(2) * received size + END_CHAR */
 	uint8_t buf[2 * (sizeof(exbuf) + sizeof(tun_rx)) + 2];
 #ifdef USE_TUN_PI
@@ -267,14 +289,14 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 			printf("tun read error\n");
 			goto fin0;
 		}
-
 #ifdef USE_TUN_PI
 		if ((size -= sizeof(pi)) < 0)
 			continue;
 #endif
-
+		p = tun_rx;
+		n = size;
 		if (extmode) {
-			if ((exsize = ext_encode(buf, size,
+			if ((exsize = ext_encode(&p, &n,
 						 exbuf, sizeof(exbuf))) < 0)
 				continue;
 		} else {
@@ -285,7 +307,8 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
 		if (exsize)
 			encode_slip_frame(buf, sizeof(buf), exbuf, exsize, &w);
-		encode_slip_frame(buf, sizeof(buf), tun_rx, size, &w);
+		if (n)
+			encode_slip_frame(buf, sizeof(buf), p, n, &w);
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
 		write(fd_ser, buf, w.outpos);
 	}
