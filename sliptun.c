@@ -45,7 +45,10 @@ static char *serdev = NULL;
 static char *tundev = NULL;
 static bool rtscts = false;
 static bool extmode = false;
-static char *extarg;
+
+#define EXTARG_MAX 8
+static int extargc = 0;
+static char *extargv[EXTARG_MAX + 1] = {NULL};
 
 enum portmode {
 	NONE, SERIAL, TCP_CLIENT, TCP_SERVER,
@@ -111,9 +114,17 @@ static int ext_dummy(uint8_t **buf, int *len, uint8_t *exbuf, int exlen)
 int ext_encode(uint8_t **buf, int *len, uint8_t *exbuf, int exlen) __attribute__((weak, alias("ext_dummy")));
 int ext_decode(uint8_t **buf, int *len, uint8_t *exbuf, int exlen) __attribute__((weak, alias("ext_dummy")));
 
- __attribute__((weak)) bool ext_init(char *arg)
+__attribute__((weak)) bool ext_init(int argc, char *argv[])
 {
+	int i;
+
 	printf("extended feature is not implemented\n");
+
+	/* test code */
+	for (i = 0; i <= argc; i++)
+		printf("argv[%d] = %s\n", i,
+		       (argv[i] == NULL) ? "(null)" : argv[i]);
+
 	return false;
 }
 
@@ -664,6 +675,8 @@ int main(int argc, char *argv[])
 {
 	int ch;
 
+	extargv[extargc++] = argv[0];
+
 	while ((ch = getopt(argc, argv, "s:p:P:l:t:fx:")) != -1) {
 		switch (ch) {
 		case 's':
@@ -689,7 +702,8 @@ int main(int argc, char *argv[])
 			break;
 		case 'x':
 			extmode = true;
-			extarg = optarg;
+			if (extargc < EXTARG_MAX)
+				extargv[extargc++] = optarg;
 			break;
 		}
 	}
@@ -701,7 +715,7 @@ int main(int argc, char *argv[])
 		goto fin0;
 	}
 
-	if (extmode && ext_init(extarg))
+	if (extmode && ext_init(extargc, extargv))
 		goto fin0;
 
 	do_main();
