@@ -217,7 +217,7 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 				iov[iovcnt].iov_len = exsize;
 				iovcnt++;
 			}
-			if (n) {
+			if (n > 0) {
 				iov[iovcnt].iov_base = p;
 				iov[iovcnt].iov_len = n;
 				iovcnt++;
@@ -318,7 +318,7 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
 		if (exsize)
 			encode_slip_frame(buf, sizeof(buf), exbuf, exsize, &w);
-		if (n)
+		if (n > 0)
 			encode_slip_frame(buf, sizeof(buf), p, n, &w);
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
 		write(fd_ser, buf, w.outpos);
