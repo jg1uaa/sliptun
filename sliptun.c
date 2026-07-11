@@ -56,6 +56,7 @@ enum portmode {
 static enum portmode portmode = NONE;
 static int portarg;
 
+static pthread_mutex_t mutex;
 static int fd_ser, fd_tun;
 static bool die = false;
 
@@ -98,6 +99,24 @@ struct decode_work {
 	int inpos;
 	bool esc;
 };
+
+static void set_die(bool status)
+{
+	pthread_mutex_lock(&mutex);
+	die = status;
+	pthread_mutex_unlock(&mutex);
+}
+
+static bool get_die(void)
+{
+	bool status;
+
+	pthread_mutex_lock(&mutex);
+	status = die;
+	pthread_mutex_unlock(&mutex);
+
+	return status;
+}
 
 static int ext_dummy(uint8_t **buf, int *len, uint8_t *exbuf, int exlen)
 {
@@ -186,7 +205,7 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 	};
 	int iovcnt;
 
-	while (!die) {
+	while (!get_die()) {
 		if ((size = read(fd_ser, buf, sizeof(buf))) < 1) {
 			printf("slip read error\n");
 			goto fin0;
@@ -245,7 +264,7 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 	}
 
 fin0:
-	die = true;
+	set_die(true);
 	return NULL;
 }
 
@@ -295,7 +314,7 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 	};
 	const int iovcnt = sizeof(iov) / sizeof(struct iovec);
 
-	while (!die) {
+	while (!get_die()) {
 		if ((size = readv(fd_tun, iov, iovcnt)) < 0) {
 			printf("tun read error\n");
 			goto fin0;
@@ -325,7 +344,7 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 	}
 
 fin0:
-	die = true;
+	set_die(true);
 	return NULL;
 }
 
@@ -652,9 +671,14 @@ static int do_main(void)
 		goto fin1;
 	}
 
+	if (pthread_mutex_init(&mutex, NULL)) {
+		printf("pthread_mutex_init error\n");
+		goto fin2;
+	}
+
 	if (pthread_create(&tid, NULL, &do_slip_tx, NULL)) {
 		printf("pthread_create error\n");
-		goto fin2;
+		goto fin3;
 	}
 
 	do_slip_rx(NULL);
@@ -663,6 +687,8 @@ static int do_main(void)
 	pthread_join(tid, NULL);
 	ret = 0;
 
+fin3:
+	pthread_mutex_destroy(&mutex);
 fin2:
 	close(fd_ser);
 fin1:
