@@ -496,21 +496,6 @@ fin0:
 	return fd;
 }
 
-static const char *inet_ntopXX(int af, const void *src, char *dst, socklen_t size)
-{
-	struct sockaddr_in *s4 = (struct sockaddr_in *)src;
-	struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)src;
-
-	switch (af) {
-	case AF_INET:
-		return inet_ntop(af, &s4->sin_addr.s_addr, dst, size);
-	case AF_INET6:
-		return inet_ntop(af, &s6->sin6_addr.s6_addr, dst, size);
-	default:
-		return strncpy(dst, "unknown", size);
-	}
-}
-
 static struct addrinfo *acquire_address_info(void)
 {
 	struct addrinfo hints, *res;
@@ -562,7 +547,7 @@ static int open_tcp_server(void)
 	struct addrinfo *res, *res0;
 	struct sockaddr_storage ss;
 	socklen_t ss_len;
-	char addr_str[INET6_ADDRSTRLEN];
+	char addr_str[NI_MAXHOST];
 
 	if ((res0 = acquire_address_info()) == NULL)
 		goto fin0;
@@ -600,7 +585,9 @@ static int open_tcp_server(void)
 			break;
 		}
 
-		inet_ntopXX(ss.ss_family, &ss, addr_str, sizeof(addr_str));
+		strcpy(addr_str, "unknown");
+		getnameinfo((struct sockaddr *)&ss, ss_len, addr_str,
+			    sizeof(addr_str), NULL, 0, NI_NUMERICHOST);
 		printf("*** CONNECTED from %s\n", addr_str);
 		break;
 	}
@@ -617,7 +604,7 @@ static int open_tcp_client(void)
 {
 	int s = -1;
 	struct addrinfo *res, *res0;
-	char addr_str[INET6_ADDRSTRLEN];
+	char addr_str[NI_MAXHOST];
 
 	if ((res0 = acquire_address_info()) == NULL)
 		goto fin0;
@@ -628,8 +615,10 @@ static int open_tcp_client(void)
 			continue;
 
 		if (connect(s, res->ai_addr, res->ai_addrlen) >= 0) {
-			inet_ntopXX(res->ai_family, res->ai_addr,
-				    addr_str, sizeof(addr_str));
+			strcpy(addr_str, "unknown");
+			getnameinfo((struct sockaddr *)res->ai_addr,
+				    res->ai_addrlen, addr_str,
+				    sizeof(addr_str), NULL, 0, NI_NUMERICHOST);
 			printf("*** CONNECTED to %s\n", addr_str);
 			break;
 		}
