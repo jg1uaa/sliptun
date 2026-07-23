@@ -92,12 +92,14 @@ struct tun_pi {
 
 struct encode_work {
 	int outpos;
+	bool drop;
 };
 
 struct decode_work {
 	int outpos;
 	int inpos;
 	bool esc;
+	bool drop;
 };
 
 static void set_die(bool status)
@@ -161,6 +163,8 @@ static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 
 			if (w->outpos < outsize)
 				out[w->outpos++] = c;
+			else
+				w->drop = true;
 		} else {
 			switch (c) {
 			case END_CHAR:
@@ -175,6 +179,8 @@ static bool decode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize
 			default:
 				if (w->outpos < outsize)
 					out[w->outpos++] = c;
+				else
+					w->drop = true;
 				break;
 			}
 		}
@@ -192,6 +198,7 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 		.outpos = 0,
 		.inpos = 0,
 		.esc = false,
+		.drop = false,
 	};
 #ifdef USE_TUN_PI
 	struct tun_pi pi = {.flags = 0};
@@ -257,9 +264,11 @@ static void *do_slip_rx(__attribute__((unused)) void *arg)
 				goto next; /* discard */
 			}
 #endif
-			writev(fd_tun, iov, iovcnt);
+			if (!w.drop)
+				writev(fd_tun, iov, iovcnt);
 		next:
 			w.outpos = 0;
+			w.drop = false;
 		}
 	}
 
@@ -270,7 +279,7 @@ fin0:
 
 static void encode_slip_frame(uint8_t *out, int outsize, uint8_t *in, int insize, struct encode_work *w)
 {
-#define put_buffer(c) {if (w->outpos < outsize) out[w->outpos++] = (c);}
+#define put_buffer(c) {if (w->outpos < outsize) out[w->outpos++] = (c); else w->drop = true;}
 
 	int i;
 
@@ -334,13 +343,15 @@ static void *do_slip_tx(__attribute__((unused)) void *arg)
 		}
 
 		w.outpos = 0;
+		w.drop = 0;
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
 		if (exsize)
 			encode_slip_frame(buf, sizeof(buf), exbuf, exsize, &w);
 		if (n > 0)
 			encode_slip_frame(buf, sizeof(buf), p, n, &w);
 		encode_slip_frame(buf, sizeof(buf), NULL, 0, &w); // END_CHAR
-		write(fd_ser, buf, w.outpos);
+		if (!w.drop)
+			write(fd_ser, buf, w.outpos);
 	}
 
 fin0:
