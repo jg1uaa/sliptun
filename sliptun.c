@@ -702,6 +702,7 @@ int main(int argc, char *argv[])
 {
 	int ch;
 
+	signal(SIGPIPE, SIG_IGN);
 	extargv[extargc++] = argv[0];
 
 	while ((ch = getopt(argc, argv, "s:p:P:l:t:fx:")) != -1) {
