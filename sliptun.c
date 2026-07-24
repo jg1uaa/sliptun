@@ -598,9 +598,9 @@ static int open_tcp_server(void)
 			break;
 		}
 
-		strcpy(addr_str, "unknown");
-		getnameinfo((struct sockaddr *)&ss, ss_len, addr_str,
-			    sizeof(addr_str), NULL, 0, NI_NUMERICHOST);
+		if (getnameinfo((struct sockaddr *)&ss, ss_len, addr_str,
+				sizeof(addr_str), NULL, 0, NI_NUMERICHOST))
+			snprintf(addr_str, sizeof(addr_str), "unknown");
 		printf("*** CONNECTED from %s\n", addr_str);
 		break;
 	}
@@ -628,10 +628,11 @@ static int open_tcp_client(void)
 			continue;
 
 		if (connect(s, res->ai_addr, res->ai_addrlen) >= 0) {
-			strcpy(addr_str, "unknown");
-			getnameinfo((struct sockaddr *)res->ai_addr,
-				    res->ai_addrlen, addr_str,
-				    sizeof(addr_str), NULL, 0, NI_NUMERICHOST);
+			if (getnameinfo((struct sockaddr *)res->ai_addr,
+					res->ai_addrlen, addr_str,
+					sizeof(addr_str), NULL, 0,
+					NI_NUMERICHOST))
+				snprintf(addr_str, sizeof(addr_str), "unknown");
 			printf("*** CONNECTED to %s\n", addr_str);
 			break;
 		}
