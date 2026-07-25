@@ -29,9 +29,10 @@ usage: sliptun -s [serial speed] -l [serial device] -t [tun device]
 #### set up SLIP peer on Linux with sliptun
 
 ```
-# sliptun -s 115200 -l /dev/ttyS1 -t tun0 &
+# ip tuntap add mode tun dev tun0
 # ip addr add 192.168.200.2 peer 192.168.200.1 dev tun0
 # ip link set tun0 mtu 296 up
+# sliptun -s 115200 -l /dev/ttyS1 -t tun0 &
 ```
 
 #### set up SLIP peer on Linux with slattach (standard tool)
