@@ -105,18 +105,25 @@ struct decode_work {
 
 static void set_die(bool status)
 {
+	int cs;
+
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
 	pthread_mutex_lock(&mutex);
 	die = status;
 	pthread_mutex_unlock(&mutex);
+	pthread_setcancelstate(cs, NULL);
 }
 
 static bool get_die(void)
 {
+	int cs;
 	bool status;
 
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
 	pthread_mutex_lock(&mutex);
 	status = die;
 	pthread_mutex_unlock(&mutex);
+	pthread_setcancelstate(cs, NULL);
 
 	return status;
 }
